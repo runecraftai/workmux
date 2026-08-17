@@ -29,11 +29,20 @@ pub(super) fn ensure_daemon_running() -> Result<PathBuf> {
 }
 
 /// Spawn the sidebar daemon as a detached background process.
+///
+/// When `SQUAD_BASE` or `SQUAD_HOME` is set, automatically uses the
+/// Squad data source instead of the default tmux data source.
 fn spawn_daemon() -> Result<()> {
     let exe = std::env::current_exe()?;
-    std::process::Command::new(exe)
-        .arg("_sidebar-daemon")
-        .stdin(std::process::Stdio::null())
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("_sidebar-daemon");
+
+    // Auto-detect Squad environment and use Squad data source
+    if std::env::var("SQUAD_BASE").is_ok() || std::env::var("SQUAD_HOME").is_ok() {
+        cmd.arg("--data-source").arg("squad");
+    }
+
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()?;
