@@ -131,6 +131,13 @@ impl SquadDataSource {
     }
 
     /// Read task metadata from `state/<id>.meta`.
+    ///
+    /// Squad writes meta files in shell key=value format (one per line),
+    /// not JSON. Example:
+    ///   window=Squad:sq-abc
+    ///   model=claude-3-opus
+    ///   effort=high
+    ///   kind=strike
     fn read_meta(&self, task_id: &str) -> Result<SquadMeta> {
         let path = self.state_dir.join(format!("{}.meta", task_id));
         if !path.exists() {
@@ -140,8 +147,29 @@ impl SquadDataSource {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read meta: {}", path.display()))?;
 
-        serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse meta JSON: {}", path.display()))
+        let mut meta = SquadMeta::default();
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((key, value)) = line.split_once('=') {
+                let value = value.trim();
+                if value.is_empty() || value == "-" {
+                    continue;
+                }
+                match key.trim() {
+                    "model" => meta.model = Some(value.to_string()),
+                    "effort" => meta.effort = Some(value.to_string()),
+                    "kind" => meta.kind = Some(value.to_string()),
+                    "mode" => meta.mode = Some(value.to_string()),
+                    "project" => meta.project = Some(value.to_string()),
+                    "worktree" => meta.worktree = Some(value.to_string()),
+                    _ => {} // Ignore unknown fields
+                }
+            }
+        }
+        Ok(meta)
     }
 
     /// Get the mtime of `state/<id>.busy-gen` as a Unix timestamp.
@@ -321,15 +349,9 @@ mod tests {
         let dir = create_test_state_dir();
         let state_dir = dir.path().join("state");
 
-        let meta_json = r#"{
-            "model": "claude-3-opus",
-            "effort": "high",
-            "kind": "strike",
-            "mode": "drill",
-            "project": "my-project",
-            "worktree": "/tmp/worktree-123"
-        }"#;
-        fs::write(state_dir.join("task-1.meta"), meta_json).unwrap();
+        // Squad writes meta in shell key=value format, not JSON
+        let meta_content = "window=Squad:sq-abc\nmodel=claude-3-opus\neffort=high\nkind=strike\nmode=drill\nproject=my-project\nworktree=/tmp/worktree-123\n";
+        fs::write(state_dir.join("task-1.meta"), meta_content).unwrap();
 
         let ds = SquadDataSource::new(state_dir);
         let meta = ds.read_meta("task-1").unwrap();
@@ -341,6 +363,23 @@ mod tests {
     }
 
     #[test]
+    fn test_read_meta_empty_values() {
+        let dir = create_test_state_dir();
+        let state_dir = dir.path().join("state");
+
+        // Squad uses '-' for unset values
+        let meta_content = "model=-\neffort=-\nkind=strike\n";
+        fs::write(state_dir.join("task-1.meta"), meta_content).unwrap();
+
+        let ds = SquadDataSource::new(state_dir);
+        let meta = ds.read_meta("task-1").unwrap();
+
+        assert!(meta.model.is_none());
+        assert!(meta.effort.is_none());
+        assert_eq!(meta.kind.unwrap(), "strike");
+    }
+
+    #[test]
     fn test_list_agents_full() {
         let dir = create_test_state_dir();
         let state_dir = dir.path().join("state");
@@ -349,14 +388,9 @@ mod tests {
         let content = "squad:main\ttask-1\tworking\tworking\tImplementing feature\n";
         fs::write(state_dir.join("window-states"), content).unwrap();
 
-        // Write meta
-        let meta_json = r#"{
-            "model": "claude-3-opus",
-            "effort": "high",
-            "kind": "strike",
-            "worktree": "/tmp/worktree-123"
-        }"#;
-        fs::write(state_dir.join("task-1.meta"), meta_json).unwrap();
+        // Write meta in shell key=value format
+        let meta_content = "model=claude-3-opus\neffort=high\nkind=strike\nworktree=/tmp/worktree-123\n";
+        fs::write(state_dir.join("task-1.meta"), meta_content).unwrap();
 
         let ds = SquadDataSource::new(state_dir);
         let agents = ds.list_agents().unwrap();
