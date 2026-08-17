@@ -85,7 +85,54 @@ New to worktrees? See [Why git worktrees?](#why-git-worktrees)
 - [Sandbox agents](#sandbox) in containers or VMs for enhanced security
 - [Automatic branch name generation](#automatic-branch-name-generation) from
   prompts using LLM
+- [Squad integration](#squad-integration) for monitoring Squad-managed tasks
 - Shell completions
+
+## Squad Integration
+
+This fork adds support for reading agent state from
+[Squad](https://github.com/runecraftai/squad), a task orchestration system for
+AI coding agents.
+
+### Usage
+
+```bash
+# Start the sidebar daemon reading from Squad's state directory
+workmux _sidebar-daemon --data-source squad
+
+# The daemon reads from $SQUAD_BASE/state/ or $SQUAD_HOME/state/
+# Falls back to ~/.fob/squad/state/ if neither is set
+```
+
+### Data Mapping
+
+Squad state files are mapped to Workmux agent panes as follows:
+
+| Squad Source | Workmux Field |
+|-------------|---------------|
+| `state/window-states` col 1 (window) | `window_name` |
+| `state/window-states` col 2 (id) | `pane_id` (synthetic `%{id}`) |
+| `state/window-states` col 3 (label) | `status` (mapped to AgentStatus) |
+| `state/window-states` col 4-5 (state/detail) | `pane_title` |
+| `state/<id>.meta` model | `agent_command` |
+| `state/<id>.meta` kind | `agent_kind` |
+| `state/<id>.busy-gen` mtime | `status_ts` |
+
+### Status Mapping
+
+| Squad Label | Workmux Status | Display |
+|-------------|----------------|---------|
+| `working` | `Working` | ⠋⠙⠹ (spinner) |
+| `done` | `Done` | ✓ |
+| `blocked` / `awaiting-decision` | `Waiting` | 💬 |
+| `failed` | `Done` | ✗ (danger color) |
+| `idle` / other | `None` | (empty) |
+
+### Environment Variables
+
+- `SQUAD_BASE` - Primary Squad base directory (takes precedence)
+- `SQUAD_HOME` - Legacy Squad home directory (fallback)
+- Default: `~/.fob/squad/`
 
 ## Hype
 
