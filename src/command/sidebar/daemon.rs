@@ -1852,6 +1852,7 @@ pub fn run() -> Result<()> {
 /// Workmux sidebar.
 pub fn run_with_data_source(
     data_source: crate::data_source::DataSourceType,
+    instance_id: Option<String>,
 ) -> Result<()> {
     match data_source {
         crate::data_source::DataSourceType::Tmux => {
@@ -1859,13 +1860,13 @@ pub fn run_with_data_source(
             run()
         }
         crate::data_source::DataSourceType::Squad => {
-            run_squad_daemon()
+            run_squad_daemon(instance_id)
         }
     }
 }
 
 /// Run the sidebar daemon reading state from Squad's state directory.
-fn run_squad_daemon() -> Result<()> {
+fn run_squad_daemon(client_instance_id: Option<String>) -> Result<()> {
     use crate::data_source::DataSource;
     use crate::data_source::squad::SquadDataSource;
 
@@ -1888,8 +1889,9 @@ fn run_squad_daemon() -> Result<()> {
         spawn_signal_listener(term.clone(), dirty_flag.clone(), wake_tx.clone())?;
     let _wake_tx_keepalive = wake_tx.clone();
 
-    // Use a fixed instance ID for Squad
-    let instance_id = "squad".to_string();
+    // Use the client's instance ID for socket naming so the client and daemon
+    // agree on the same socket path. Fall back to "squad" when no ID is passed.
+    let instance_id = client_instance_id.unwrap_or_else(|| "squad".to_string());
     let sock_path = socket_path(&instance_id);
     let _ = std::fs::remove_file(&sock_path);
     let server = SocketServer::bind(&sock_path)?;

@@ -34,6 +34,8 @@ pub(super) fn ensure_daemon_running() -> Result<PathBuf> {
 /// Squad data source instead of the default tmux data source.
 fn spawn_daemon() -> Result<()> {
     let exe = std::env::current_exe()?;
+    let mux = create_backend(detect_backend());
+    let instance_id = mux.instance_id();
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("_sidebar-daemon");
 
@@ -41,6 +43,9 @@ fn spawn_daemon() -> Result<()> {
     if std::env::var("SQUAD_BASE").is_ok() || std::env::var("SQUAD_HOME").is_ok() {
         cmd.arg("--data-source").arg("squad");
     }
+
+    // Pass instance ID so daemon uses the same socket path as the client
+    cmd.arg("--instance-id").arg(&instance_id);
 
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
