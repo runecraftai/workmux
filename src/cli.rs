@@ -678,7 +678,11 @@ enum Commands {
 
     /// Run the sidebar daemon (internal use)
     #[command(hide = true, name = "_sidebar-daemon")]
-    SidebarDaemon,
+    SidebarDaemon {
+        /// Data source for agent state: "tmux" (default) or "squad"
+        #[arg(long, default_value = "tmux")]
+        data_source: crate::data_source::DataSourceType,
+    },
 
     /// Show a TUI dashboard of all active workmux agents across all sessions
     Dashboard {
@@ -1084,7 +1088,9 @@ pub fn run() -> Result<()> {
         Commands::SidebarSync { window } => command::sidebar::sync(window.as_deref()),
         Commands::SidebarReflow { window } => command::sidebar::reflow(window.as_deref()),
         Commands::SidebarReflowAll { exclude } => command::sidebar::reflow_all(exclude.as_deref()),
-        Commands::SidebarDaemon => command::sidebar::run_daemon(),
+        Commands::SidebarDaemon { data_source } => {
+            command::sidebar::run_daemon_with_source(data_source)
+        }
         Commands::Dashboard {
             preview_size,
             diff,

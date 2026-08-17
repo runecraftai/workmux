@@ -737,6 +737,13 @@ pub fn run_daemon() -> Result<()> {
     daemon::run()
 }
 
+/// Run the sidebar daemon with a specific data source.
+pub fn run_daemon_with_source(
+    data_source: crate::data_source::DataSourceType,
+) -> Result<()> {
+    daemon::run_with_data_source(data_source)
+}
+
 /// Run the sidebar TUI (called by the hidden `_sidebar-run` command).
 pub fn run_sidebar() -> Result<()> {
     runtime::run_sidebar()

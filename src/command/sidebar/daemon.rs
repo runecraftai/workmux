@@ -1845,6 +1845,244 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+/// Run the sidebar daemon with a specific data source.
+///
+/// When `data_source` is `Squad`, reads agent state from Squad's state directory
+/// instead of polling tmux. This enables monitoring Squad-managed tasks in the
+/// Workmux sidebar.
+pub fn run_with_data_source(
+    data_source: crate::data_source::DataSourceType,
+) -> Result<()> {
+    match data_source {
+        crate::data_source::DataSourceType::Tmux => {
+            // Default tmux behavior
+            run()
+        }
+        crate::data_source::DataSourceType::Squad => {
+            run_squad_daemon()
+        }
+    }
+}
+
+/// Run the sidebar daemon reading state from Squad's state directory.
+fn run_squad_daemon() -> Result<()> {
+    use crate::data_source::DataSource;
+    use crate::data_source::squad::SquadDataSource;
+
+    let squad_source = SquadDataSource::from_env()?;
+    tracing::info!(
+        state_dir = ?squad_source.state_dir(),
+        "sidebar daemon starting with Squad data source"
+    );
+
+    let config = Arc::new(Mutex::new(Config::load(None)?));
+    let status_icons = config.lock().unwrap().status_icons.clone();
+    let config_version = Arc::new(AtomicU64::new(0));
+
+    // Signal state for clean shutdown and dirty notification.
+    let term = Arc::new(AtomicBool::new(false));
+    let dirty_flag = Arc::new(AtomicBool::new(false));
+
+    let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (signal_handle, signal_thread) =
+        spawn_signal_listener(term.clone(), dirty_flag.clone(), wake_tx.clone())?;
+    let _wake_tx_keepalive = wake_tx.clone();
+
+    // Use a fixed instance ID for Squad
+    let instance_id = "squad".to_string();
+    let sock_path = socket_path(&instance_id);
+    let _ = std::fs::remove_file(&sock_path);
+    let server = SocketServer::bind(&sock_path)?;
+
+    // Config watcher
+    let _config_paths_tx = spawn_config_watcher(
+        term.clone(),
+        config.clone(),
+        config_version.clone(),
+        dirty_flag.clone(),
+        wake_tx.clone(),
+    );
+
+    // Background workers (git/github not needed for Squad, but keep for compatibility)
+    let (git_cache, git_path_tx) =
+        spawn_git_worker(term.clone(), dirty_flag.clone(), wake_tx.clone());
+    let (pr_cache, check_cache, github_path_tx) =
+        spawn_github_worker(term.clone(), dirty_flag.clone(), wake_tx);
+
+    let mut inactivity_tracker = InactivityTracker::new(Duration::from_secs(10));
+    let mut last_interrupted: HashSet<String> = HashSet::new();
+    let mut last_runtime_write = Instant::now();
+    let backend_name = "squad".to_string();
+
+    let mut last_refresh = Instant::now();
+    let mut last_client_seen = Instant::now();
+    let mut dirty_pending = false;
+    let mut last_agent_list = String::new();
+    let refresh_interval = Duration::from_secs(2);
+    let debounce_interval = Duration::from_millis(50);
+
+    while !term.load(Ordering::Relaxed) {
+        if dirty_flag.swap(false, Ordering::Relaxed) {
+            dirty_pending = true;
+        }
+
+        let time_since_refresh = last_refresh.elapsed();
+        let debounce_cleared = dirty_pending && time_since_refresh >= debounce_interval;
+        let timer_expired = time_since_refresh >= refresh_interval;
+
+        if debounce_cleared || timer_expired {
+            dirty_pending = false;
+            last_refresh = Instant::now();
+
+            // Read agents from Squad data source
+            let agents = match squad_source.list_agents() {
+                Ok(agents) => agents,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to read Squad state");
+                    continue;
+                }
+            };
+
+            // Use empty tmux state since we're reading from Squad
+            let tmux_state = TmuxState {
+                window_statuses: HashMap::new(),
+                active_windows: HashSet::new(),
+                pane_window_ids: HashMap::new(),
+                pane_window_indexes: HashMap::new(),
+                active_pane_ids: HashSet::new(),
+                window_pane_counts: HashMap::new(),
+            };
+
+            let (position, layout_mode, sort) = {
+                let cfg = config.lock().unwrap();
+                (
+                    super::read_sidebar_position(&cfg),
+                    read_sidebar_layout_mode(&cfg).unwrap_or_default(),
+                    cfg.sidebar.sort.unwrap_or_default(),
+                )
+            };
+            let filter_mode = read_sidebar_filter_mode();
+            let sleeping_pane_ids = read_sleeping_panes();
+            let git_statuses = git_cache.lock().ok().map(|c| c.clone()).unwrap_or_default();
+            let pr_statuses = pr_cache.lock().ok().map(|c| c.clone()).unwrap_or_default();
+            let check_statuses = check_cache
+                .lock()
+                .ok()
+                .map(|cache| cache.clone())
+                .unwrap_or_default();
+
+            // No pane captures for Squad (no tmux panes to inspect)
+            let captured_panes: HashMap<String, String> = HashMap::new();
+            let now = Instant::now();
+            let now_ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let heartbeat_due = last_runtime_write.elapsed() >= Duration::from_secs(10);
+
+            // Compute tick
+            let mut output = compute_tick(
+                TickInput {
+                    agents,
+                    tmux_state,
+                    captured_panes,
+                    now,
+                    now_ts,
+                    position,
+                    layout_mode,
+                    filter_mode,
+                    sort,
+                    git_statuses,
+                    pr_statuses,
+                    check_statuses,
+                    sleeping_pane_ids,
+                },
+                &mut inactivity_tracker,
+                &last_interrupted,
+                &status_icons,
+                heartbeat_due,
+            );
+
+            // Apply side effects
+            if let Ok(store) = StateStore::new()
+                && apply_tick_effects(&output, &store, &backend_name, &instance_id)
+            {
+                last_runtime_write = Instant::now();
+            }
+            last_interrupted = output.next_interrupted;
+
+            // Stamp config version + broadcast
+            output.snapshot.config_version = config_version.load(Ordering::Relaxed);
+            server.broadcast(&output.snapshot);
+
+            // Update git worker with current agent paths
+            let stale_threshold = 60 * 60;
+            let entries: Vec<GitWorkerPath> = output
+                .snapshot
+                .agents
+                .iter()
+                .map(|a| GitWorkerPath {
+                    path: a.path.clone(),
+                    is_stale: a
+                        .status_ts
+                        .map(|ts| now_ts.saturating_sub(ts) > stale_threshold)
+                        .unwrap_or(false),
+                })
+                .collect();
+            let _ = git_path_tx.send(entries);
+
+            let github_entries: Vec<GithubWorkerPath> = output
+                .snapshot
+                .agents
+                .iter()
+                .filter_map(|a| {
+                    let branch = output.snapshot.git_statuses.get(&a.path)?.branch.as_ref()?;
+                    Some(GithubWorkerPath {
+                        path: a.path.clone(),
+                        branch: branch.clone(),
+                    })
+                })
+                .collect();
+            let _ = github_path_tx.send(github_entries);
+
+            let agent_list: String = output
+                .snapshot
+                .agents
+                .iter()
+                .map(|a| a.pane_id.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if agent_list != last_agent_list {
+                last_agent_list = agent_list;
+            }
+        }
+
+        // Track client activity for auto-exit
+        let cc = server.client_count();
+        if cc > 0 {
+            last_client_seen = Instant::now();
+        }
+
+        // Auto-exit when no clients for 5 minutes (unless we have agents)
+        if last_client_seen.elapsed() > Duration::from_secs(300) && server.client_count() == 0 {
+            tracing::info!("no clients for 5 minutes, exiting");
+            break;
+        }
+
+        // Wait for next tick or signal
+        let _ = wake_rx.recv_timeout(Duration::from_millis(100));
+    }
+
+    // Cleanup
+    signal_handle.close();
+    let _ = signal_thread.join();
+    let _ = std::fs::remove_file(&sock_path);
+    if let Ok(store) = StateStore::new() {
+        store.delete_runtime(&backend_name, &instance_id);
+    }
+    Ok(())
+}
+
 // ── Tick core ────────────────────────────────────────────────────────────
 
 /// Inputs gathered from the environment for one daemon tick.
