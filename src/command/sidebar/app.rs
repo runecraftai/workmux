@@ -4,7 +4,7 @@ use anyhow::Result;
 use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,10 +12,10 @@ use std::time::{Duration, Instant};
 use crate::agent_display::{extract_project_name, extract_worktree_name, resolve_labels};
 use crate::cmd::Cmd;
 use crate::config::{AgentIcons, Config, SidebarPosition, SidebarWidth, StatusIcons};
-use crate::data_source::{SidebarEntry, worktree_key};
 use crate::git::GitStatus;
 use crate::github::{CheckSummary, PrSummary};
 use ratatui::style::Color;
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use tracing::warn;
 
@@ -208,40 +208,6 @@ pub(super) struct HostIdentity {
     pub pane_id: String,
 }
 
-/// One visible row in the hierarchical sidebar tree.
-///
-/// Derived from `SidebarApp::entries` + the expansion sets. Drives tree
-/// rendering (connectors), navigation (skip collapsed children) and mouse
-/// hit testing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TreeRow {
-    /// Index into `SidebarApp::entries`.
-    pub entry_idx: usize,
-    /// Render depth: 0 = session, 1 = worktree, 2 = pane. A revealed pane
-    /// beneath a collapsed session renders at depth 1 (worktree elided).
-    pub depth: u8,
-    /// Whether this row is the last visible child of its parent (drives the
-    /// `└─` connector). Sessions are roots and use the chevron instead.
-    pub is_last: bool,
-    /// For depth-2 rows: whether the worktree ancestor has a following
-    /// sibling worktree (drives the `│` continuation under the worktree).
-    pub worktree_has_sibling: bool,
-}
-
-/// Identity key for preserving the tree selection across snapshots.
-/// `(0, session)` / `(1, worktree_key)` / `(2, pane_id)`.
-fn entry_identity(entry: &SidebarEntry) -> Option<(u8, String)> {
-    match entry {
-        SidebarEntry::Session { session, .. } => Some((0, session.clone())),
-        SidebarEntry::Worktree {
-            session,
-            worktree_path,
-            ..
-        } => Some((1, worktree_key(session, worktree_path))),
-        SidebarEntry::Pane { pane_id, .. } => Some((2, pane_id.clone())),
-    }
-}
-
 /// Lightweight sidebar app state. No preview, git, PR, diff, or input mode.
 pub struct SidebarApp {
     pub mux: Arc<dyn Multiplexer>,
@@ -321,19 +287,6 @@ pub struct SidebarApp {
     suppress_resize_once: bool,
     /// Filter mode: show all agents or only those in the host tmux session.
     pub filter_mode: SidebarFilterMode,
-    /// Hierarchical entries (session → worktree → pane) from the daemon
-    /// snapshot. Empty when the flat tmux data source is active.
-    pub entries: Vec<SidebarEntry>,
-    /// Whether to render the hierarchy tree. The Squad data source enables
-    /// it by default; the flat tmux source keeps it off.
-    pub hierarchy_enabled: bool,
-    /// Sessions the user has expanded. Everything is collapsed by default.
-    pub expanded_session_keys: HashSet<String>,
-    /// Worktrees the user has expanded, keyed by `data_source::worktree_key`.
-    pub expanded_worktree_keys: HashSet<String>,
-    /// Visible tree rows derived from `entries` + expansion state. Rebuilt
-    /// after every snapshot and collapse/expand change.
-    pub visible_rows: Vec<TreeRow>,
 }
 
 impl SidebarApp {
@@ -391,11 +344,6 @@ impl SidebarApp {
             resize_deadline: None,
             suppress_resize_once: false,
             filter_mode: SidebarFilterMode::default(),
-            entries: Vec::new(),
-            hierarchy_enabled: false,
-            expanded_session_keys: HashSet::new(),
-            expanded_worktree_keys: HashSet::new(),
-            visible_rows: Vec::new(),
         }
     }
 
@@ -474,11 +422,6 @@ impl SidebarApp {
             resize_deadline: None,
             suppress_resize_once: false,
             filter_mode: SidebarFilterMode::default(),
-            entries: Vec::new(),
-            hierarchy_enabled: false,
-            expanded_session_keys: HashSet::new(),
-            expanded_worktree_keys: HashSet::new(),
-            visible_rows: Vec::new(),
         })
     }
 
@@ -531,15 +474,6 @@ impl SidebarApp {
             .and_then(|i| self.agents.get(i))
             .map(|a| a.pane_id.clone());
 
-        // Preserve the tree selection by entry identity (session/worktree/pane).
-        let selected_entry_identity = if self.hierarchy_enabled || snapshot.hierarchy_enabled {
-            self.selected_entry_idx()
-                .and_then(|i| self.entries.get(i))
-                .and_then(entry_identity)
-        } else {
-            None
-        };
-
         self.agents = snapshot.agents;
 
         // Apply session filter: retain only agents in the sidebar's host session.
@@ -555,48 +489,22 @@ impl SidebarApp {
             );
         }
 
-        // Hierarchy state (additive; flat tmux snapshots leave it disabled).
-        self.hierarchy_enabled = snapshot.hierarchy_enabled;
-        self.entries = snapshot.entries;
-        if self.hierarchy_enabled {
-            if self.filter_mode == SidebarFilterMode::Session
-                && let Some(host_session) = self.host_session().map(str::to_owned)
-            {
-                self.entries.retain(|e| e.session() == host_session);
+        // Restore selection
+        if let Some(ref pane_id) = selected_pane {
+            if let Some(idx) = self.agents.iter().position(|a| &a.pane_id == pane_id) {
+                self.list_state.select(Some(idx));
+            } else if !self.agents.is_empty() {
+                let clamped = self
+                    .list_state
+                    .selected()
+                    .unwrap_or(0)
+                    .min(self.agents.len() - 1);
+                self.list_state.select(Some(clamped));
+            } else {
+                self.list_state.select(None);
             }
-            self.recompute_visible_rows();
-            if let Some(identity) = selected_entry_identity
-                && let Some(ei) = self
-                    .entries
-                    .iter()
-                    .position(|e| entry_identity(e).as_ref() == Some(&identity))
-            {
-                self.select_entry_index(ei);
-            } else if self.list_state.selected().is_none() && !self.visible_rows.is_empty() {
-                self.list_state.select(Some(0));
-            }
-        } else {
-            self.visible_rows.clear();
-        }
-
-        if !self.hierarchy_enabled {
-            // Restore selection
-            if let Some(ref pane_id) = selected_pane {
-                if let Some(idx) = self.agents.iter().position(|a| &a.pane_id == pane_id) {
-                    self.list_state.select(Some(idx));
-                } else if !self.agents.is_empty() {
-                    let clamped = self
-                        .list_state
-                        .selected()
-                        .unwrap_or(0)
-                        .min(self.agents.len() - 1);
-                    self.list_state.select(Some(clamped));
-                } else {
-                    self.list_state.select(None);
-                }
-            } else if !self.agents.is_empty() && self.list_state.selected().is_none() {
-                self.list_state.select(Some(0));
-            }
+        } else if !self.agents.is_empty() && self.list_state.selected().is_none() {
+            self.list_state.select(Some(0));
         }
 
         self.sync_selection();
@@ -605,18 +513,6 @@ impl SidebarApp {
     /// Select the agent belonging to this sidebar's host window (only in FollowHost mode).
     pub fn sync_selection(&mut self) {
         if self.selection_mode != SelectionMode::FollowHost {
-            return;
-        }
-        if self.hierarchy_enabled {
-            // Map the host pane to its tree row (or nearest visible ancestor).
-            if let Some(idx) = self.host_agent_idx
-                && let Some(agent) = self.agents.get(idx)
-                && let Some(ei) = self.entries.iter().position(|e| {
-                    matches!(e, SidebarEntry::Pane { pane_id, .. } if pane_id == &agent.pane_id)
-                })
-            {
-                self.select_entry_index(ei);
-            }
             return;
         }
         if let Some(idx) = self.host_agent_idx {
@@ -691,58 +587,44 @@ impl SidebarApp {
         self.spinner_frame = self.spinner_frame.wrapping_add(1) % 10;
     }
 
-    /// Number of selectable rows: visible tree rows in hierarchy mode, agents otherwise.
-    fn row_len(&self) -> usize {
-        if self.hierarchy_enabled {
-            self.visible_rows.len()
-        } else {
-            self.agents.len()
-        }
-    }
-
     pub fn next(&mut self) {
         self.selection_mode = SelectionMode::Manual;
-        let len = self.row_len();
-        if len == 0 {
+        if self.agents.is_empty() {
             return;
         }
         let i = self.list_state.selected().unwrap_or(0);
-        let next = if i >= len - 1 { 0 } else { i + 1 };
+        let next = if i >= self.agents.len() - 1 { 0 } else { i + 1 };
         self.list_state.select(Some(next));
     }
 
     pub fn previous(&mut self) {
         self.selection_mode = SelectionMode::Manual;
-        let len = self.row_len();
-        if len == 0 {
+        if self.agents.is_empty() {
             return;
         }
         let i = self.list_state.selected().unwrap_or(0);
-        let prev = if i == 0 { len - 1 } else { i - 1 };
+        let prev = if i == 0 { self.agents.len() - 1 } else { i - 1 };
         self.list_state.select(Some(prev));
     }
 
     pub fn select_first(&mut self) {
         self.selection_mode = SelectionMode::Manual;
-        let len = self.row_len();
-        if len > 0 {
+        if !self.agents.is_empty() {
             self.list_state.select(Some(0));
         }
     }
 
     pub fn select_last(&mut self) {
         self.selection_mode = SelectionMode::Manual;
-        let len = self.row_len();
-        if len > 0 {
-            self.list_state.select(Some(len - 1));
+        if !self.agents.is_empty() {
+            self.list_state.select(Some(self.agents.len() - 1));
         }
     }
 
     pub fn select_index(&mut self, idx: usize) {
         self.selection_mode = SelectionMode::Manual;
-        let len = self.row_len();
-        if len > 0 {
-            self.list_state.select(Some(idx.min(len - 1)));
+        if !self.agents.is_empty() {
+            self.list_state.select(Some(idx.min(self.agents.len() - 1)));
         }
     }
 
@@ -756,13 +638,13 @@ impl SidebarApp {
     pub fn scroll_down(&mut self) {
         self.selection_mode = SelectionMode::Manual;
         if let Some(i) = self.list_state.selected() {
-            let last = self.row_len().saturating_sub(1);
+            let last = self.agents.len().saturating_sub(1);
             self.list_state.select(Some((i + 1).min(last)));
         }
     }
 
     pub fn hit_test(&self, column: u16, row: u16) -> Option<usize> {
-        if self.agents.is_empty() && self.entries.is_empty() {
+        if self.agents.is_empty() {
             return None;
         }
         let area = self.list_area;
@@ -780,13 +662,6 @@ impl SidebarApp {
 
         let relative_row = (row - area.y) as usize;
         let offset = self.list_state.offset();
-
-        // Tree rows are one line per visible entry; selection indexes the
-        // visible-row list, so hit testing is a plain row offset.
-        if self.hierarchy_enabled {
-            let idx = offset + relative_row;
-            return (idx < self.visible_rows.len()).then_some(idx);
-        }
 
         match self.layout_mode {
             SidebarLayoutMode::Compact => {
@@ -833,29 +708,6 @@ impl SidebarApp {
     }
 
     pub fn jump_to_selected(&mut self) {
-        if self.hierarchy_enabled {
-            let Some(ei) = self.selected_entry_idx() else {
-                return;
-            };
-            match self.entries[ei].clone() {
-                SidebarEntry::Pane { pane_id, .. } => {
-                    let _ = self.mux.switch_to_pane(&pane_id, None);
-                    // Signal daemon directly to bypass tmux hook round-trip latency
-                    super::daemon_ctrl::signal_daemon();
-                }
-                SidebarEntry::Session { session, .. } => {
-                    self.toggle_expand_session(&session);
-                }
-                SidebarEntry::Worktree {
-                    session,
-                    worktree_path,
-                    ..
-                } => {
-                    self.toggle_expand_worktree(&session, &worktree_path);
-                }
-            }
-            return;
-        }
         if let Some(idx) = self.list_state.selected()
             && let Some(agent) = self.agents.get(idx)
         {
@@ -863,285 +715,6 @@ impl SidebarApp {
             let _ = self.mux.switch_to_pane(&pane_id, None);
             // Signal daemon directly to bypass tmux hook round-trip latency
             super::daemon_ctrl::signal_daemon();
-        }
-    }
-
-    // ── Hierarchy navigation ────────────────────────────────────────────
-
-    /// Rebuild `visible_rows` from the current entries + expansion state.
-    /// Call after every snapshot, expand and collapse change.
-    pub fn recompute_visible_rows(&mut self) {
-        self.visible_rows = self.compute_visible_rows();
-    }
-
-    /// Derive the visible tree rows.
-    ///
-    /// Visibility rules:
-    /// - Session rows are always visible.
-    /// - Worktree rows are visible while their session is expanded.
-    /// - Pane rows are visible while their session and worktree are both
-    ///   expanded — except the most-recently-active task, which is always
-    ///   revealed beneath its collapsed ancestors (Herdr-style), so the
-    ///   collapsed default still shows what's currently happening.
-    fn compute_visible_rows(&self) -> Vec<TreeRow> {
-        // Most-recently-active task (by status_ts from the flat agent list;
-        // ties keep the earliest entry).
-        let mut active_pane: Option<(usize, u64)> = None;
-        for (i, entry) in self.entries.iter().enumerate() {
-            let SidebarEntry::Pane { pane_id, .. } = entry else {
-                continue;
-            };
-            let ts = self
-                .agents
-                .iter()
-                .find(|a| &a.pane_id == pane_id)
-                .and_then(|a| a.status_ts)
-                .unwrap_or(0);
-            if active_pane.is_none_or(|(_, best)| ts > best) {
-                active_pane = Some((i, ts));
-            }
-        }
-        let active_entry = active_pane.map(|(i, _)| i);
-
-        let expanded_sessions = &self.expanded_session_keys;
-        let expanded_worktrees = &self.expanded_worktree_keys;
-        let mut rows: Vec<TreeRow> = Vec::new();
-        // (session, worktree_path) of the most recent Worktree entry, plus
-        // whether that worktree has a following sibling worktree.
-        let mut current_worktree: Option<(String, String)> = None;
-        let mut current_wt_has_sibling = false;
-        let mut current_session_expanded = false;
-
-        for (i, entry) in self.entries.iter().enumerate() {
-            match entry {
-                SidebarEntry::Session { session, .. } => {
-                    current_session_expanded = expanded_sessions.contains(session);
-                    current_worktree = None;
-                    rows.push(TreeRow {
-                        entry_idx: i,
-                        depth: 0,
-                        is_last: true,
-                        worktree_has_sibling: false,
-                    });
-                }
-                SidebarEntry::Worktree {
-                    session,
-                    worktree_path,
-                    ..
-                } => {
-                    current_worktree = Some((session.clone(), worktree_path.clone()));
-                    let is_last = matches!(
-                        self.entries.get(i + 1),
-                        None | Some(SidebarEntry::Session { .. })
-                    );
-                    current_wt_has_sibling = !is_last;
-                    if current_session_expanded {
-                        rows.push(TreeRow {
-                            entry_idx: i,
-                            depth: 1,
-                            is_last,
-                            worktree_has_sibling: current_wt_has_sibling,
-                        });
-                    }
-                }
-                SidebarEntry::Pane { .. } => {
-                    let wt_expanded = current_worktree
-                        .as_ref()
-                        .map(|(s, p)| expanded_worktrees.contains(&worktree_key(s, p)))
-                        .unwrap_or(false);
-                    let normally_visible = current_session_expanded && wt_expanded;
-                    if normally_visible {
-                        let is_last = matches!(
-                            self.entries.get(i + 1),
-                            None | Some(SidebarEntry::Worktree { .. })
-                                | Some(SidebarEntry::Session { .. })
-                        );
-                        rows.push(TreeRow {
-                            entry_idx: i,
-                            depth: 2,
-                            is_last,
-                            worktree_has_sibling: current_wt_has_sibling,
-                        });
-                    } else if Some(i) == active_entry {
-                        // Reveal the active task beneath its collapsed ancestors.
-                        rows.push(TreeRow {
-                            entry_idx: i,
-                            depth: if current_session_expanded { 2 } else { 1 },
-                            is_last: true,
-                            worktree_has_sibling: false,
-                        });
-                    }
-                }
-            }
-        }
-        rows
-    }
-
-    /// Entry index of the currently selected tree row.
-    pub fn selected_entry_idx(&self) -> Option<usize> {
-        self.list_state
-            .selected()
-            .and_then(|row| self.visible_rows.get(row))
-            .map(|r| r.entry_idx)
-    }
-
-    /// Select the entry at `entry_idx` through the visible rows. When the
-    /// entry is hidden (collapsed), selects its nearest visible ancestor.
-    pub fn select_entry_index(&mut self, entry_idx: usize) {
-        if let Some(row) = self
-            .visible_rows
-            .iter()
-            .position(|r| r.entry_idx == entry_idx)
-        {
-            self.list_state.select(Some(row));
-            return;
-        }
-        if let Some(ancestor) = self.visible_ancestor_index(entry_idx)
-            && let Some(row) = self
-                .visible_rows
-                .iter()
-                .position(|r| r.entry_idx == ancestor)
-        {
-            self.list_state.select(Some(row));
-        } else if !self.visible_rows.is_empty() {
-            self.list_state.select(Some(0));
-        }
-    }
-
-    /// Index of the nearest visible ancestor entry for a (possibly hidden) entry.
-    fn visible_ancestor_index(&self, entry_idx: usize) -> Option<usize> {
-        match self.entries.get(entry_idx) {
-            Some(SidebarEntry::Pane { .. }) => {
-                let wt = self.entries[..entry_idx]
-                    .iter()
-                    .rposition(|e| matches!(e, SidebarEntry::Worktree { .. }));
-                if let Some(wt) = wt.filter(|t| self.visible_rows.iter().any(|r| r.entry_idx == *t))
-                {
-                    return Some(wt);
-                }
-                self.entries[..entry_idx]
-                    .iter()
-                    .rposition(|e| matches!(e, SidebarEntry::Session { .. }))
-            }
-            Some(SidebarEntry::Worktree { .. }) => self.entries[..entry_idx]
-                .iter()
-                .rposition(|e| matches!(e, SidebarEntry::Session { .. })),
-            _ => None,
-        }
-    }
-
-    /// Move the selection to the selected entry's parent (nearest visible ancestor).
-    fn select_parent(&mut self) {
-        let Some(ei) = self.selected_entry_idx() else {
-            return;
-        };
-        let parent = match &self.entries[ei] {
-            SidebarEntry::Pane { .. } => self.entries[..ei].iter().rposition(|e| {
-                matches!(
-                    e,
-                    SidebarEntry::Worktree { .. } | SidebarEntry::Session { .. }
-                )
-            }),
-            SidebarEntry::Worktree { .. } => self.entries[..ei]
-                .iter()
-                .rposition(|e| matches!(e, SidebarEntry::Session { .. })),
-            SidebarEntry::Session { .. } => None,
-        };
-        if let Some(p) = parent {
-            self.select_entry_index(p);
-        }
-    }
-
-    /// Toggle expand/collapse of a session group.
-    pub fn toggle_expand_session(&mut self, session: &str) {
-        if !self.expanded_session_keys.remove(session) {
-            self.expanded_session_keys.insert(session.to_string());
-        }
-        self.recompute_visible_rows();
-    }
-
-    /// Toggle expand/collapse of a worktree group.
-    pub fn toggle_expand_worktree(&mut self, session: &str, worktree_path: &str) {
-        let key = worktree_key(session, worktree_path);
-        if !self.expanded_worktree_keys.remove(&key) {
-            self.expanded_worktree_keys.insert(key);
-        }
-        self.recompute_visible_rows();
-    }
-
-    /// Expand the selected group; if already expanded, move to its first child.
-    /// Right / `l`.
-    pub fn expand_group(&mut self) {
-        if !self.hierarchy_enabled {
-            return;
-        }
-        let Some(ei) = self.selected_entry_idx() else {
-            return;
-        };
-        match self.entries[ei].clone() {
-            SidebarEntry::Session { session, .. } => {
-                if !self.expanded_session_keys.contains(&session) {
-                    self.toggle_expand_session(&session);
-                }
-                if let Some(child) = self
-                    .visible_rows
-                    .iter()
-                    .position(|r| r.depth >= 1 && r.entry_idx > ei)
-                {
-                    self.list_state.select(Some(child));
-                }
-            }
-            SidebarEntry::Worktree {
-                session,
-                worktree_path,
-                ..
-            } => {
-                if !self
-                    .expanded_worktree_keys
-                    .contains(&worktree_key(&session, &worktree_path))
-                {
-                    self.toggle_expand_worktree(&session, &worktree_path);
-                }
-                if let Some(child) = self.visible_rows.iter().position(|r| r.entry_idx > ei) {
-                    self.list_state.select(Some(child));
-                }
-            }
-            SidebarEntry::Pane { .. } => {}
-        }
-    }
-
-    /// Collapse the selected group; if already collapsed (or on a pane), move
-    /// the selection to the nearest visible ancestor. Left / `h`.
-    pub fn collapse_group(&mut self) {
-        if !self.hierarchy_enabled {
-            return;
-        }
-        let Some(ei) = self.selected_entry_idx() else {
-            return;
-        };
-        match self.entries[ei].clone() {
-            SidebarEntry::Session { session, .. } => {
-                if self.expanded_session_keys.contains(&session) {
-                    self.toggle_expand_session(&session);
-                }
-            }
-            SidebarEntry::Worktree {
-                session,
-                worktree_path,
-                ..
-            } => {
-                if self
-                    .expanded_worktree_keys
-                    .contains(&worktree_key(&session, &worktree_path))
-                {
-                    self.toggle_expand_worktree(&session, &worktree_path);
-                } else {
-                    self.select_parent();
-                }
-            }
-            SidebarEntry::Pane { .. } => {
-                self.select_parent();
-            }
         }
     }
 
@@ -2009,271 +1582,5 @@ mod filter_tests {
     #[test]
     fn filter_mode_default_shows_all_sessions() {
         assert_eq!(SidebarFilterMode::default(), SidebarFilterMode::None);
-    }
-}
-
-#[cfg(test)]
-mod hierarchy_tests {
-    use super::*;
-    use crate::command::sidebar::snapshot::SidebarSnapshot;
-    use crate::multiplexer::types::AgentStatus;
-
-    const WT_MAIN: &str = "/home/rehem/.fob/squad-b4752b/1/squad";
-    const WT_STRIKE: &str = "/tmp/squad-strike-xyz";
-
-    fn agent(pane_id: &str, window: &str, status: AgentStatus, ts: u64) -> AgentPane {
-        AgentPane {
-            session: "Squad".to_string(),
-            window_name: window.to_string(),
-            pane_id: pane_id.to_string(),
-            window_id: String::new(),
-            window_index: None,
-            path: PathBuf::from(WT_MAIN),
-            pane_title: None,
-            status: Some(status),
-            status_ts: Some(ts),
-            updated_ts: Some(ts),
-            window_cmd: None,
-            agent_command: None,
-            agent_kind: None,
-        }
-    }
-
-    fn pane(task_id: &str, status: AgentStatus, label: &str) -> SidebarEntry {
-        SidebarEntry::Pane {
-            task_id: task_id.to_string(),
-            session: "Squad".to_string(),
-            window_name: task_id.to_string(),
-            pane_id: format!("%{task_id}"),
-            label: label.to_string(),
-            detail: String::new(),
-            status: Some(status),
-            agent_kind: None,
-            agent_command: None,
-        }
-    }
-
-    fn entries() -> Vec<SidebarEntry> {
-        vec![
-            SidebarEntry::Session {
-                session: "Squad".to_string(),
-                label: Some("Squad base".to_string()),
-                task_count: 3,
-                aggregate_status: Some(AgentStatus::Working),
-            },
-            SidebarEntry::Worktree {
-                session: "Squad".to_string(),
-                worktree_path: WT_MAIN.to_string(),
-                branch: Some("main".to_string()),
-                task_count: 2,
-                aggregate_status: Some(AgentStatus::Working),
-            },
-            pane("sq-abc", AgentStatus::Working, "working"),
-            pane("sq-def", AgentStatus::Done, "done"),
-            SidebarEntry::Worktree {
-                session: "Squad".to_string(),
-                worktree_path: WT_STRIKE.to_string(),
-                branch: Some("fix/sidebar".to_string()),
-                task_count: 1,
-                aggregate_status: Some(AgentStatus::Working),
-            },
-            pane("sq-ghi", AgentStatus::Working, "working"),
-        ]
-    }
-
-    fn agents() -> Vec<AgentPane> {
-        vec![
-            agent("%sq-abc", "sq-abc", AgentStatus::Working, 100),
-            agent("%sq-def", "sq-def", AgentStatus::Done, 200),
-            agent("%sq-ghi", "sq-ghi", AgentStatus::Working, 300),
-        ]
-    }
-
-    fn tree_app() -> SidebarApp {
-        let mut app = SidebarApp::test_with_template_error(TemplateError {
-            location: String::new(),
-            message: String::new(),
-        });
-        app.template_error = None;
-        app.hierarchy_enabled = true;
-        app.entries = entries();
-        app.agents = agents();
-        app.recompute_visible_rows();
-        app
-    }
-
-    fn visible_task_ids(app: &SidebarApp) -> Vec<String> {
-        app.visible_rows
-            .iter()
-            .filter_map(|r| match &app.entries[r.entry_idx] {
-                SidebarEntry::Pane { task_id, .. } => Some(task_id.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn collapsed_default_shows_session_and_reveals_active_task() {
-        let mut app = tree_app();
-
-        // Everything is collapsed by default: only the session row plus the
-        // most-recently-active task (sq-ghi) revealed beneath it.
-        assert_eq!(app.visible_rows.len(), 2);
-        assert_eq!(app.visible_rows[0].depth, 0);
-        assert_eq!(app.visible_rows[1].depth, 1);
-        assert_eq!(visible_task_ids(&app), vec!["sq-ghi"]);
-
-        // Navigation cycles through the visible rows only. Note: `next()` with
-        // no selection starts from index 0 and advances (pre-existing flat
-        // wrap semantics), so the first press lands on row 1.
-        app.next();
-        assert_eq!(app.list_state.selected(), Some(1));
-        app.next();
-        assert_eq!(app.list_state.selected(), Some(0));
-        app.next();
-        assert_eq!(app.list_state.selected(), Some(1));
-    }
-
-    #[test]
-    fn expanding_session_reveals_worktrees_then_panes() {
-        let mut app = tree_app();
-
-        app.toggle_expand_session("Squad");
-        // Session + both worktrees; panes still hidden (worktrees collapsed),
-        // except the active task sq-ghi revealed beneath its collapsed worktree.
-        assert_eq!(app.visible_rows.len(), 4);
-        assert_eq!(app.visible_rows[1].depth, 1);
-        assert_eq!(app.visible_rows[2].depth, 1);
-        assert_eq!(visible_task_ids(&app), vec!["sq-ghi"]);
-
-        app.toggle_expand_worktree("Squad", WT_MAIN);
-        // session(0) wt1(1) sq-abc(2) sq-def(2) wt2(1) sq-ghi-revealed(2)
-        let depths: Vec<u8> = app.visible_rows.iter().map(|r| r.depth).collect();
-        assert_eq!(depths, vec![0, 1, 2, 2, 1, 2]);
-        assert_eq!(visible_task_ids(&app), vec!["sq-abc", "sq-def", "sq-ghi"]);
-
-        // Connector flags: sq-abc's worktree (main) has a following sibling;
-        // sq-ghi's worktree (fix/sidebar) is the last in the session.
-        assert!(app.visible_rows[2].worktree_has_sibling);
-        assert!(!app.visible_rows[5].worktree_has_sibling);
-    }
-
-    #[test]
-    fn collapse_moves_selection_to_nearest_visible_ancestor() {
-        let mut app = tree_app();
-        app.toggle_expand_session("Squad");
-        app.toggle_expand_worktree("Squad", WT_MAIN);
-
-        // Select sq-abc (visible row 2), then collapse via Left on the pane.
-        app.select_index(2);
-        assert_eq!(app.selected_entry_idx(), Some(2));
-        app.collapse_group();
-        assert_eq!(app.selected_entry_idx(), Some(1)); // worktree main
-
-        // Collapse the worktree: selection stays on its row (now hidden children).
-        app.collapse_group();
-        assert_eq!(app.selected_entry_idx(), Some(1));
-        // session, wt1, wt2, revealed sq-ghi
-        assert_eq!(app.visible_rows.len(), 4);
-
-        // Collapse again (already collapsed): move to the session.
-        app.collapse_group();
-        assert_eq!(app.selected_entry_idx(), Some(0));
-    }
-
-    #[test]
-    fn enter_on_group_toggles_expansion() {
-        let mut app = tree_app();
-        app.select_first(); // session row
-        app.jump_to_selected();
-        assert!(app.expanded_session_keys.contains("Squad"));
-        assert_eq!(app.visible_rows.len(), 4); // + wt1 + wt2 + revealed active task
-
-        app.jump_to_selected(); // toggle back
-        assert!(!app.expanded_session_keys.contains("Squad"));
-        assert_eq!(app.visible_rows.len(), 2);
-    }
-
-    #[test]
-    fn right_expands_and_descends() {
-        let mut app = tree_app();
-        app.select_first(); // session
-        app.expand_group();
-        // Session expanded; selection moves to its first child (worktree main).
-        assert_eq!(app.visible_rows.len(), 4);
-        assert_eq!(app.selected_entry_idx(), Some(1));
-
-        // Expand the worktree: first child is sq-abc.
-        app.expand_group();
-        assert_eq!(app.selected_entry_idx(), Some(2));
-        assert_eq!(
-            visible_task_ids(&app).first().map(String::as_str),
-            Some("sq-abc")
-        );
-    }
-
-    #[test]
-    fn apply_snapshot_preserves_tree_selection_by_identity() {
-        let mut app = tree_app();
-        app.toggle_expand_session("Squad");
-        app.toggle_expand_worktree("Squad", WT_MAIN);
-        app.select_index(2); // sq-abc
-
-        let snapshot = SidebarSnapshot {
-            position: SidebarPosition::Left,
-            layout_mode: SidebarLayoutMode::Tiles,
-            filter_mode: SidebarFilterMode::None,
-            active_windows: HashSet::new(),
-            active_pane_ids: HashSet::new(),
-            window_pane_counts: HashMap::new(),
-            git_statuses: HashMap::new(),
-            pr_statuses: HashMap::new(),
-            check_statuses: HashMap::new(),
-            interrupted_pane_ids: HashSet::new(),
-            sleeping_pane_ids: HashSet::new(),
-            agents: agents(),
-            entries: entries(),
-            hierarchy_enabled: true,
-            config_version: 0,
-        };
-
-        app.apply_snapshot(snapshot);
-
-        assert_eq!(app.selected_entry_idx(), Some(2));
-        assert!(app.expanded_session_keys.contains("Squad"));
-        assert!(app.hierarchy_enabled);
-    }
-
-    #[test]
-    fn flat_snapshot_disables_hierarchy_and_keeps_agent_selection() {
-        let mut app = tree_app();
-        app.select_first();
-
-        let snapshot = SidebarSnapshot {
-            position: SidebarPosition::Left,
-            layout_mode: SidebarLayoutMode::Tiles,
-            filter_mode: SidebarFilterMode::None,
-            active_windows: HashSet::new(),
-            active_pane_ids: HashSet::new(),
-            window_pane_counts: HashMap::new(),
-            git_statuses: HashMap::new(),
-            pr_statuses: HashMap::new(),
-            check_statuses: HashMap::new(),
-            interrupted_pane_ids: HashSet::new(),
-            sleeping_pane_ids: HashSet::new(),
-            agents: agents(),
-            entries: Vec::new(),
-            hierarchy_enabled: false,
-            config_version: 0,
-        };
-
-        app.apply_snapshot(snapshot);
-
-        assert!(!app.hierarchy_enabled);
-        assert!(app.entries.is_empty());
-        assert!(app.visible_rows.is_empty());
-        assert_eq!(app.agents.len(), 3);
-        // Flat restore selects row 0 when nothing was selected before.
-        assert_eq!(app.list_state.selected(), Some(0));
     }
 }

@@ -1692,8 +1692,6 @@ pub fn run() -> Result<()> {
                     pr_statuses,
                     check_statuses,
                     sleeping_pane_ids,
-                    entries: Vec::new(),
-                    hierarchy_enabled: false,
                 },
                 &mut inactivity_tracker,
                 &last_interrupted,
@@ -1861,7 +1859,9 @@ pub fn run_with_data_source(
             // Default tmux behavior
             run()
         }
-        crate::data_source::DataSourceType::Squad => run_squad_daemon(instance_id),
+        crate::data_source::DataSourceType::Squad => {
+            run_squad_daemon(instance_id)
+        }
     }
 }
 
@@ -1945,17 +1945,6 @@ fn run_squad_daemon(client_instance_id: Option<String>) -> Result<()> {
                 }
             };
 
-            // Read the hierarchy (session → worktree → pane). On any read
-            // failure, fall back to an empty tree (the flat agent list still
-            // renders) rather than wedging the daemon tick.
-            let entries = match squad_source.list_entries() {
-                Ok(entries) => entries,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to read Squad hierarchy");
-                    Vec::new()
-                }
-            };
-
             // Use empty tmux state since we're reading from Squad
             let tmux_state = TmuxState {
                 window_statuses: HashMap::new(),
@@ -2009,8 +1998,6 @@ fn run_squad_daemon(client_instance_id: Option<String>) -> Result<()> {
                     pr_statuses,
                     check_statuses,
                     sleeping_pane_ids,
-                    entries,
-                    hierarchy_enabled: true,
                 },
                 &mut inactivity_tracker,
                 &last_interrupted,
@@ -2115,10 +2102,6 @@ struct TickInput {
     pr_statuses: HashMap<PathBuf, PrPathEntry>,
     check_statuses: HashMap<PathBuf, CheckPathEntry>,
     sleeping_pane_ids: HashSet<String>,
-    /// Hierarchical entries (empty for the flat tmux source).
-    entries: Vec<crate::data_source::SidebarEntry>,
-    /// Whether clients should render the hierarchy (Squad source: on by default).
-    hierarchy_enabled: bool,
 }
 
 /// A state-file write to apply after computing the tick.
@@ -2165,8 +2148,6 @@ fn compute_tick(
         pr_statuses,
         check_statuses,
         sleeping_pane_ids,
-        entries,
-        hierarchy_enabled,
     } = input;
 
     // Phase 1: Inactivity detection
@@ -2207,8 +2188,6 @@ fn compute_tick(
         &sleeping_pane_ids,
     );
     snapshot.interrupted_pane_ids = interrupted.clone();
-    snapshot.entries = entries;
-    snapshot.hierarchy_enabled = hierarchy_enabled;
 
     // Phase 4: Determine runtime write side effect
     let runtime_write = if interrupted != *last_interrupted || heartbeat_due {
@@ -2843,8 +2822,6 @@ mod tests {
                     pr_statuses: HashMap::new(),
                     check_statuses: HashMap::new(),
                     sleeping_pane_ids: HashSet::new(),
-                    entries: Vec::new(),
-                    hierarchy_enabled: false,
                 },
                 tracker,
                 last,

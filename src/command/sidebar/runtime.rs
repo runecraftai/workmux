@@ -365,8 +365,6 @@ fn handle_key_press(
         }
         (KeyCode::Char('j'), _) | (KeyCode::Down, _) => app.next(),
         (KeyCode::Char('k'), _) | (KeyCode::Up, _) => app.previous(),
-        (KeyCode::Right, _) | (KeyCode::Char('l'), _) => app.expand_group(),
-        (KeyCode::Left, _) | (KeyCode::Char('h'), _) => app.collapse_group(),
         (KeyCode::Enter, _) => app.jump_to_selected(),
         (KeyCode::Char('G'), _) => app.select_last(),
         (KeyCode::Char('g'), _) => app.select_first(),
