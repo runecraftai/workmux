@@ -234,9 +234,13 @@ impl DataSource for SquadDataSource {
             };
 
             let agent = AgentPane {
-                session,
+                session: session.clone(),
                 window_name,
-                pane_id: format!("%{}", entry.id),
+                // Use the real session:window target (e.g. "squad:my-task") as
+                // pane_id.  This is a valid tmux target for switch-client -t,
+                // unlike the synthetic %task-id which only looks like a tmux
+                // pane-id but isn't one.
+                pane_id: entry.window.clone(),
                 window_id: String::new(),
                 window_index: None,
                 path: meta
@@ -248,7 +252,13 @@ impl DataSource for SquadDataSource {
                 status: Self::map_status(&entry.label),
                 status_ts: busy_gen_mtime,
                 updated_ts: busy_gen_mtime,
-                window_cmd: None,
+                // Use empty string instead of None: Squad's window names are real
+                // task IDs (always meaningful), not auto-tracked shell names.
+                // A real tmux backend provides pane_current_command; we have no live
+                // pane, so we supply a sentinel that lets the window name pass
+                // `is_window_meaningful` (it differs from any real task ID and is
+                // not a generic shell name).
+                window_cmd: Some("".to_string()),
                 agent_command,
                 agent_kind: meta.kind,
             };
@@ -380,6 +390,28 @@ mod tests {
     }
 
     #[test]
+    fn test_pane_id_is_valid_tmux_window_target() {
+        // Squad agents must produce pane_ids that resolve to real tmux
+        // session:window targets, not synthetic %task-id strings.
+        let dir = create_test_state_dir();
+        let state_dir = dir.path().join("state");
+
+        let content =
+            "squad:my-task\tsq-my-task\tworking\tworking\tRecon\n";
+        fs::write(state_dir.join("window-states"), content).unwrap();
+
+        let ds = SquadDataSource::new(state_dir);
+        let agents = ds.list_agents().unwrap();
+        let agent = &agents[0];
+
+        // pane_id must be a valid tmux session:window target
+        assert_eq!(agent.pane_id, "squad:my-task");
+        // ...not a synthetic %-prefixed fake pane-id
+        assert!(!agent.pane_id.starts_with('%'),
+            "pane_id must not be a synthetic %%-prefixed id: {}", agent.pane_id);
+    }
+
+    #[test]
     fn test_list_agents_full() {
         let dir = create_test_state_dir();
         let state_dir = dir.path().join("state");
@@ -399,7 +431,8 @@ mod tests {
         let agent = &agents[0];
         assert_eq!(agent.session, "squad");
         assert_eq!(agent.window_name, "main");
-        assert_eq!(agent.pane_id, "%task-1");
+        // pane_id is the real session:window target, not a synthetic %task-id
+        assert_eq!(agent.pane_id, "squad:main");
         assert_eq!(agent.status, Some(AgentStatus::Working));
         assert_eq!(agent.path, PathBuf::from("/tmp/worktree-123"));
         assert_eq!(agent.agent_kind.as_ref().unwrap(), "strike");

@@ -518,6 +518,28 @@ mod tests {
     }
 
     #[test]
+    fn resolve_labels_squad_window_cmd_empty_promotes_task_id() {
+        // Squad agents have window_cmd = Some("") as a sentinel; task-ID window
+        // names must be promoted to primary, not fall through to session/project.
+        let (primary, secondary) = resolve_labels(
+            "squad",
+            "squad",
+            "main",
+            "sq-my-task-id",
+            Some(""),
+        );
+        assert_eq!(primary, "sq-my-task-id");
+        assert_eq!(secondary, "squad \u{00b7} main");
+    }
+
+    #[test]
+    fn resolve_labels_squad_window_cmd_empty_not_generic_name() {
+        // Generic names like "zsh" should still be blocked even with empty cmd.
+        let (primary, _) = resolve_labels("squad", "squad", "main", "zsh", Some(""));
+        assert_eq!(primary, "squad");
+    }
+
+    #[test]
     fn test_strip_oc_title_prefix() {
         assert_eq!(
             strip_oc_title_prefix("OC | Investigating..."),

@@ -982,8 +982,21 @@ impl Multiplexer for TmuxBackend {
         self.tmux_cmd(&["resize-pane", "-Z", "-t", pane_id])
     }
 
-    fn switch_to_pane(&self, pane_id: &str, _window_hint: Option<&str>) -> Result<()> {
-        self.tmux_cmd(&["switch-client", "-t", pane_id])
+    fn switch_to_pane(&self, pane_id: &str, window_hint: Option<&str>) -> Result<()> {
+        // Real tmux pane IDs are `%N` (percent + digits). Non-tmux backends
+        // (e.g. Squad's data source) produce synthetic IDs like `%task-name`.
+        // When the pane_id isn't a real tmux target, fall back to the window
+        // hint (session:window target) so the switch still succeeds.
+        let is_real_tmux_pane = pane_id.starts_with('%')
+            && pane_id[1..].chars().all(|c| c.is_ascii_digit());
+        let target = if is_real_tmux_pane {
+            pane_id
+        } else if let Some(hint) = window_hint {
+            hint
+        } else {
+            pane_id
+        };
+        self.tmux_cmd(&["switch-client", "-t", target])
     }
 
     fn kill_pane(&self, pane_id: &str) -> Result<()> {
