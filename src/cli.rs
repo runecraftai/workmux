@@ -682,6 +682,10 @@ enum Commands {
         /// Data source for agent state: "tmux" (default) or "squad"
         #[arg(long, default_value = "tmux")]
         data_source: crate::data_source::DataSourceType,
+
+        /// Instance ID for socket naming (defaults to tmux instance ID)
+        #[arg(long)]
+        instance_id: Option<String>,
     },
 
     /// Show a TUI dashboard of all active workmux agents across all sessions
@@ -1088,9 +1092,10 @@ pub fn run() -> Result<()> {
         Commands::SidebarSync { window } => command::sidebar::sync(window.as_deref()),
         Commands::SidebarReflow { window } => command::sidebar::reflow(window.as_deref()),
         Commands::SidebarReflowAll { exclude } => command::sidebar::reflow_all(exclude.as_deref()),
-        Commands::SidebarDaemon { data_source } => {
-            command::sidebar::run_daemon_with_source(data_source)
-        }
+        Commands::SidebarDaemon {
+            data_source,
+            instance_id,
+        } => command::sidebar::run_daemon_with_source(data_source, instance_id),
         Commands::Dashboard {
             preview_size,
             diff,
