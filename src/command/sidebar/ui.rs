@@ -9,12 +9,13 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use unicode_width::UnicodeWidthChar;
 
+use crate::data_source::SidebarEntry;
 use crate::git::GitStatus;
 use crate::multiplexer::{AgentPane, AgentStatus};
 use crate::tmux_style;
 use crate::ui::theme::ThemePalette;
 
-use super::app::{SidebarApp, SidebarFilterMode, SidebarLayoutMode};
+use super::app::{SidebarApp, SidebarFilterMode, SidebarLayoutMode, TreeRow};
 use super::template::TokenId;
 use super::template::context::RowContext;
 use super::template::layout::{
@@ -481,8 +482,20 @@ pub fn render_sidebar(f: &mut Frame, app: &mut SidebarApp) {
     app.list_area = list_area;
 
     match app.layout_mode {
-        SidebarLayoutMode::Compact => render_compact_list(f, app, list_area),
-        SidebarLayoutMode::Tiles => render_tile_list(f, app, list_area),
+        SidebarLayoutMode::Compact => {
+            if app.hierarchy_enabled && !app.entries.is_empty() {
+                render_tree_list(f, app, list_area);
+            } else {
+                render_compact_list(f, app, list_area);
+            }
+        }
+        SidebarLayoutMode::Tiles => {
+            if app.hierarchy_enabled && !app.entries.is_empty() {
+                render_tree_list(f, app, list_area);
+            } else {
+                render_tile_list(f, app, list_area);
+            }
+        }
     }
 
     if let Some(filter_rect) = filter_area {
@@ -763,6 +776,211 @@ fn truncate_to_width(s: &str, max_width: usize) -> String {
         width += ch_width;
     }
     out
+}
+
+/// Tree layout: the hierarchical (session → worktree → pane) list.
+///
+/// Groups are collapsed by default; one row per visible entry with tree
+/// connectors. The most-recently-active task is always revealed even beneath
+/// collapsed groups, so the collapsed default still shows what's happening.
+fn render_tree_list(f: &mut Frame, app: &mut SidebarApp, area: Rect) {
+    if app.entries.is_empty() {
+        render_no_agents(f, app, area);
+        return;
+    }
+
+    let setup = sidebar_list_setup(app);
+    let width = area.width as usize;
+    let selected_agent_idx = app
+        .selected_entry_idx()
+        .and_then(|ei| match &app.entries[ei] {
+            SidebarEntry::Pane { pane_id, .. } => {
+                app.agents.iter().position(|a| &a.pane_id == pane_id)
+            }
+            _ => None,
+        });
+
+    let items: Vec<ListItem> = app
+        .visible_rows
+        .iter()
+        .enumerate()
+        .map(|(row_idx, row)| {
+            let mut spans = tree_row_spans(app, row, &setup, selected_agent_idx, width);
+            if app.list_state.selected() == Some(row_idx) {
+                apply_selection_bg(&mut spans, app.palette.highlight_row_bg);
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let list = List::new(items).highlight_style(Style::default().bg(app.palette.highlight_row_bg));
+    f.render_stateful_widget(list, area, &mut app.list_state);
+}
+
+/// Build the styled spans for one tree row.
+fn tree_row_spans(
+    app: &SidebarApp,
+    row: &TreeRow,
+    setup: &SidebarListSetup,
+    selected_agent_idx: Option<usize>,
+    width: usize,
+) -> Vec<Span<'static>> {
+    let dimmed = app.palette.dimmed;
+    match &app.entries[row.entry_idx] {
+        SidebarEntry::Session {
+            session,
+            label,
+            task_count,
+            aggregate_status,
+        } => {
+            let expanded = app.expanded_session_keys.contains(session);
+            let chevron = if expanded { "▾ " } else { "▸ " };
+            let name = truncate_to_width(
+                label.as_deref().unwrap_or(session),
+                width.saturating_sub(14),
+            );
+            let mut spans = vec![Span::styled(chevron, Style::default().fg(dimmed))];
+            spans.push(Span::styled(
+                name,
+                Style::default()
+                    .fg(app.palette.text)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            append_group_summary(&mut spans, app, *aggregate_status, *task_count);
+            spans
+        }
+        SidebarEntry::Worktree {
+            worktree_path,
+            branch,
+            task_count,
+            aggregate_status,
+            ..
+        } => {
+            let connector = if row.is_last {
+                "  └─ "
+            } else {
+                "  ├─ "
+            };
+            let short_path = worktree_path
+                .rsplit('/')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(worktree_path);
+            let label = match branch {
+                Some(b) => format!("{b} · {short_path}"),
+                None => short_path.to_string(),
+            };
+            let label = truncate_to_width(&label, width.saturating_sub(14));
+            let label_style = if branch.is_some() {
+                Style::default()
+                    .fg(app.palette.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(app.palette.text)
+            };
+            let mut spans = vec![Span::styled(connector, Style::default().fg(dimmed))];
+            spans.push(Span::styled(label, label_style));
+            append_group_summary(&mut spans, app, *aggregate_status, *task_count);
+            spans
+        }
+        SidebarEntry::Pane {
+            pane_id,
+            window_name,
+            task_id,
+            label,
+            ..
+        } => {
+            let (prefix, connector) = match row.depth {
+                2 => (
+                    if row.worktree_has_sibling {
+                        "  │   "
+                    } else {
+                        "      "
+                    },
+                    if row.is_last { "└─ " } else { "├─ " },
+                ),
+                _ => ("  ", if row.is_last { "└─ " } else { "├─ " }),
+            };
+            let mut spans = vec![
+                Span::styled(prefix, Style::default().fg(dimmed)),
+                Span::styled(connector, Style::default().fg(dimmed)),
+            ];
+            if let Some(agent_idx) = app.agents.iter().position(|a| &a.pane_id == pane_id) {
+                let ctx = RowContext::build(
+                    app,
+                    &app.agents[agent_idx],
+                    agent_idx,
+                    &setup.pane_suffixes,
+                    setup.now_secs,
+                    selected_agent_idx,
+                );
+                for (text, style) in &ctx.status_icon_spans {
+                    spans.push(Span::styled(text.clone(), *style));
+                }
+                // Squad tasks are identified by their task ID (window name).
+                let primary = if window_name.is_empty() {
+                    task_id
+                } else {
+                    window_name
+                };
+                let primary = truncate_to_width(primary, width.saturating_sub(16));
+                spans.push(Span::styled(
+                    format!(" {primary}"),
+                    Style::default().fg(app.palette.text),
+                ));
+                if !label.is_empty() && label != "unknown" {
+                    spans.push(Span::styled(
+                        format!(" {label}"),
+                        Style::default().fg(dimmed),
+                    ));
+                }
+                if !ctx.elapsed.is_empty() {
+                    spans.push(Span::styled(
+                        format!("  {}", ctx.elapsed),
+                        Style::default().fg(dimmed),
+                    ));
+                }
+            } else {
+                // Entry without a matching flat agent (defensive): label only.
+                spans.push(Span::styled(
+                    format!(
+                        " {}",
+                        if window_name.is_empty() {
+                            task_id
+                        } else {
+                            window_name
+                        }
+                    ),
+                    Style::default().fg(app.palette.text),
+                ));
+            }
+            spans
+        }
+    }
+}
+
+/// Append the aggregate status icon + task count to a group row.
+fn append_group_summary(
+    spans: &mut Vec<Span<'static>>,
+    app: &SidebarApp,
+    status: Option<AgentStatus>,
+    count: usize,
+) {
+    let dimmed = app.palette.dimmed;
+    let (icon_spans, _) = status_icon_and_style(app, status, false);
+    let has_icon = icon_spans.iter().any(|(t, _)| !t.trim().is_empty());
+    spans.push(Span::raw("  "));
+    if has_icon {
+        for (text, style) in &icon_spans {
+            spans.push(Span::styled(text.clone(), *style));
+        }
+        spans.push(Span::raw(" "));
+    }
+    let noun = if count == 1 { "task" } else { "tasks" };
+    spans.push(Span::styled(
+        format!("{count} {noun}"),
+        Style::default().fg(dimmed),
+    ));
 }
 
 /// Compact single-line-per-agent list (original layout).
@@ -1143,6 +1361,123 @@ mod tests {
             sanitize_pane_title(Some("OC |"), "worktree", "project"),
             None
         );
+    }
+
+    #[test]
+    fn tree_render_collapsed_default_shows_session_and_active_task() {
+        use crate::data_source::SidebarEntry;
+        use crate::multiplexer::types::AgentStatus;
+        use std::path::PathBuf;
+
+        fn pane(task_id: &str, status: AgentStatus, label: &str) -> SidebarEntry {
+            SidebarEntry::Pane {
+                task_id: task_id.to_string(),
+                session: "Squad".to_string(),
+                window_name: task_id.to_string(),
+                pane_id: format!("%{task_id}"),
+                label: label.to_string(),
+                detail: String::new(),
+                status: Some(status),
+                agent_kind: None,
+                agent_command: None,
+            }
+        }
+        fn agent(pane_id: &str, status: AgentStatus, ts: u64) -> AgentPane {
+            AgentPane {
+                session: "Squad".to_string(),
+                window_name: pane_id.trim_start_matches('%').to_string(),
+                pane_id: pane_id.to_string(),
+                window_id: String::new(),
+                window_index: None,
+                path: PathBuf::from("/home/rehem/.fob/squad-b4752b/1/squad"),
+                pane_title: None,
+                status: Some(status),
+                status_ts: Some(ts),
+                updated_ts: Some(ts),
+                window_cmd: None,
+                agent_command: None,
+                agent_kind: None,
+            }
+        }
+
+        let wt_main = "/home/rehem/.fob/squad-b4752b/1/squad";
+        let wt_strike = "/tmp/squad-strike-xyz";
+        let entries = vec![
+            SidebarEntry::Session {
+                session: "Squad".to_string(),
+                label: Some("Squad base".to_string()),
+                task_count: 3,
+                aggregate_status: Some(AgentStatus::Working),
+            },
+            SidebarEntry::Worktree {
+                session: "Squad".to_string(),
+                worktree_path: wt_main.to_string(),
+                branch: Some("main".to_string()),
+                task_count: 2,
+                aggregate_status: Some(AgentStatus::Working),
+            },
+            pane("sq-abc", AgentStatus::Working, "working"),
+            pane("sq-def", AgentStatus::Done, "done"),
+            SidebarEntry::Worktree {
+                session: "Squad".to_string(),
+                worktree_path: wt_strike.to_string(),
+                branch: Some("fix/sidebar".to_string()),
+                task_count: 1,
+                aggregate_status: Some(AgentStatus::Working),
+            },
+            pane("sq-ghi", AgentStatus::Working, "working"),
+        ];
+
+        let mut app = SidebarApp::test_with_template_error(TemplateError {
+            location: String::new(),
+            message: String::new(),
+        });
+        app.template_error = None;
+        app.hierarchy_enabled = true;
+        app.entries = entries;
+        app.agents = vec![
+            agent("%sq-abc", AgentStatus::Working, 100),
+            agent("%sq-def", AgentStatus::Done, 200),
+            agent("%sq-ghi", AgentStatus::Working, 300),
+        ];
+        app.recompute_visible_rows();
+
+        // Collapsed default: session row + revealed active task only.
+        let backend = TestBackend::new(64, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_sidebar(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = (0..12)
+            .flat_map(|y| (0..64).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(text.contains("Squad base"), "session label should render");
+        assert!(text.contains("3 tasks"), "session count should render");
+        assert!(
+            text.contains("sq-ghi"),
+            "most-recently-active task should be revealed when collapsed"
+        );
+        assert!(!text.contains("sq-abc"), "hidden pane should not render");
+        assert!(!text.contains("sq-def"), "hidden pane should not render");
+        assert!(
+            !text.contains("main"),
+            "collapsed worktree should not render"
+        );
+
+        // Expand session + first worktree: panes appear with tree connectors.
+        app.toggle_expand_session("Squad");
+        app.toggle_expand_worktree("Squad", wt_main);
+        terminal.draw(|f| render_sidebar(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = (0..12)
+            .flat_map(|y| (0..64).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(text.contains("main"), "worktree branch should render");
+        assert!(text.contains("sq-abc"), "expanded pane should render");
+        assert!(text.contains("sq-def"), "expanded pane should render");
+        assert!(text.contains("fix/sidebar"));
+        assert!(text.contains("▾"), "expanded session should show chevron");
+        assert!(text.contains("├─"), "tree connectors should render");
+        assert!(text.contains("└─"), "tree connectors should render");
     }
 
     #[test]
