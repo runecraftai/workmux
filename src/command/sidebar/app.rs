@@ -712,7 +712,14 @@ impl SidebarApp {
             && let Some(agent) = self.agents.get(idx)
         {
             let pane_id = agent.pane_id.clone();
-            let _ = self.mux.switch_to_pane(&pane_id, None);
+            // Pass window name as hint for non-tmux backends (e.g. Squad) whose
+            // synthetic pane IDs aren't real tmux targets.
+            let window_hint = if agent.window_name.is_empty() {
+                None
+            } else {
+                Some(agent.window_name.as_str())
+            };
+            let _ = self.mux.switch_to_pane(&pane_id, window_hint);
             // Signal daemon directly to bypass tmux hook round-trip latency
             super::daemon_ctrl::signal_daemon();
         }
